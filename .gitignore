@@ -23,3 +23,11 @@ venv/
 __pycache__/
 .pytest_cache/
 .DS_Store
+
+# 本地 SQLite 数据文件
+data/*.db
+data/*.db-shm
+data/*.db-wal
+*.db
+*.db-shm
+*.db-wal
