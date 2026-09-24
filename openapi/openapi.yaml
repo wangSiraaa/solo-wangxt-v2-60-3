@@ -1,0 +1,569 @@
+openapi: 3.0.3
+info:
+  title: 关键岗位交接服务 API
+  version: 1.0.0
+  description: >
+    作业进行中关键岗位（负责人 LEADER / 安全员 SAFETY_OFFICER / 联络员 LIAISON / 防护员 GUARD）
+    双向确认交接。
+
+
+    核心规则：
+      1. 仅在计划开工之后、销记之前（IN_PROGRESS）可发起交接；
+      2. 必须交班人、接班人双向确认，第二个确认到达时在单事务内完成原子责任切换；
+      3. 完成时复核：接班人已到岗、资质覆盖剩余作业窗口（至 planned_end）、
+         交班人仍为当前责任人、接班人未兼任其他必需岗位；任一不满足则整体回滚，无部分切换；
+      4. 每个必需岗位任意时刻恰好一名在任责任人（不空岗、不兼任）；
+      5. 超过 confirm_deadline 的迟到确认仅将交接置 TIMED_OUT，不能夺取责任；
+      6. 拒绝必须填写原因；交接保留发起时责任快照与模拟回执引用；
+      7. 销记固化最终责任矩阵，销记后不得再交接。
+
+servers:
+  - url: /api
+
+tags:
+  - name: Catalog
+    description: 人员、资质、到离岗
+  - name: Tickets
+    description: 工作票生命周期与责任矩阵
+  - name: Handovers
+    description: 关键岗位交接
+  - name: Admin
+    description: 模拟时钟、超时扫描、审计、回执
+
+paths:
+  /people:
+    post:
+      tags: [Catalog]
+      summary: 创建人员
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreatePerson' }
+      responses:
+        '201': { description: 已创建, content: { application/json: { schema: { $ref: '#/components/schemas/PersonResponse' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+    get:
+      tags: [Catalog]
+      summary: 人员列表
+      responses:
+        '200': { description: OK }
+  /people/{id}:
+    get:
+      tags: [Catalog]
+      summary: 人员详情
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: OK }
+        '404': { $ref: '#/components/responses/Error' }
+  /people/{id}/qualifications:
+    post:
+      tags: [Catalog]
+      summary: 登记岗位资质（有效期需覆盖作业剩余窗口）
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QualificationInput' }
+      responses:
+        '201': { description: 已登记 }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+  /tickets/{id}/presence/{workerId}/arrive:
+    post:
+      tags: [Catalog]
+      summary: 接班人到岗登记
+      parameters: [{ $ref: '#/components/parameters/Id' }, { $ref: '#/components/parameters/WorkerId' }]
+      responses:
+        '201': { description: 已到岗 }
+        '404': { $ref: '#/components/responses/Error' }
+  /tickets/{id}/presence/{workerId}/departure:
+    post:
+      tags: [Catalog]
+      summary: 离岗登记
+      parameters: [{ $ref: '#/components/parameters/Id' }, { $ref: '#/components/parameters/WorkerId' }]
+      responses:
+        '200': { description: OK }
+
+  /tickets:
+    post:
+      tags: [Tickets]
+      summary: 创建工作票（CREATED）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTicket' }
+      responses:
+        '201': { description: 已创建, content: { application/json: { schema: { $ref: '#/components/schemas/TicketResponse' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+  /tickets/{id}:
+    get:
+      tags: [Tickets]
+      summary: 工作票详情（读取时自动结算超时交接）
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/TicketResponse' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+  /tickets/{id}/start:
+    post:
+      tags: [Tickets]
+      summary: 计划开工时间到达后进入作业进行中
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: IN_PROGRESS, content: { application/json: { schema: { $ref: '#/components/schemas/TicketResponse' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+        '409':
+          description: BEFORE_PLANNED_START / TICKET_CLOSED
+          content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } }
+  /tickets/{id}/assignments:
+    post:
+      tags: [Tickets]
+      summary: 初始布岗（每个必需岗位指派一人）
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [position, worker_id]
+              properties:
+                position: { $ref: '#/components/schemas/Position' }
+                worker_id: { type: integer }
+      responses:
+        '201': { description: 当前责任矩阵 }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /tickets/{id}/responsibility:
+    get:
+      tags: [Tickets]
+      summary: 当前责任矩阵
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: OK }
+        '404': { $ref: '#/components/responses/Error' }
+  /tickets/{id}/close:
+    post:
+      tags: [Tickets]
+      summary: 销记（固化最终责任人；存在在途交接时 409）
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: 已销记, content: { application/json: { schema: { $ref: '#/components/schemas/ClosureResponse' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+        '409':
+          description: PENDING_HANDOVERS_BLOCK_CLOSE / TICKET_CLOSED
+          content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } }
+  /tickets/{id}/closure:
+    get:
+      tags: [Tickets]
+      summary: 销记记录（最终责任人追溯）
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ClosureResponse' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+  /tickets/{id}/handovers:
+    get:
+      tags: [Tickets]
+      summary: 本票全部交接
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: OK }
+        '404': { $ref: '#/components/responses/Error' }
+  /tickets/{id}/handover-chain:
+    get:
+      tags: [Tickets]
+      summary: 交接链（按审计顺序，重启后一致）
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - name: position
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/Position' }
+      responses:
+        '200': { description: OK }
+        '404': { $ref: '#/components/responses/Error' }
+  /tickets/{id}/audit:
+    get:
+      tags: [Tickets]
+      summary: 本票审计流（严格 seq 递增）
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: OK }
+        '404': { $ref: '#/components/responses/Error' }
+  /tickets/{id}/receipts:
+    get:
+      tags: [Tickets]
+      summary: 本票模拟回执
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: OK }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /handovers:
+    post:
+      tags: [Handovers]
+      summary: 发起交接（计划开工后、IN_PROGRESS）
+      description: >
+        发起人必须是本票当前在岗关键岗位人员。系统以该岗位当前在任人为交班人。
+        同岗位存在 PENDING 交接时返回 409 PENDING_HANDOVER_EXISTS。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InitiateHandover' }
+      responses:
+        '201': { description: 已发起, content: { application/json: { schema: { $ref: '#/components/schemas/HandoverResponse' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409':
+          description: >
+            TICKET_NOT_IN_PROGRESS / BEFORE_PLANNED_START / TICKET_CLOSED /
+            POSITION_NOT_ASSIGNED / INCOMING_HOLDS_OTHER_POSITION /
+            PENDING_HANDOVER_EXISTS
+          content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } }
+        '422':
+          description: （发起阶段不做资格校验；资格在完成时校验）
+  /handovers/{id}:
+    get:
+      tags: [Handovers]
+      summary: 交接详情（读取时自动结算超时）
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/HandoverResponse' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+  /handovers/{id}/confirm-outgoing:
+    post:
+      tags: [Handovers]
+      summary: 交班人确认（重复确认幂等）
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody: { $ref: '#/components/requestBodies/Confirm' }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ConfirmResponse' } } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409':
+          description: HANDOVER_TIMED_OUT（迟到确认）/ HANDOVER_NOT_PENDING / TICKET_CLOSED
+          content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } }
+        '422':
+          description: >
+            双确认齐备但完成条件不满足（QUALIFICATION_INSUFFICIENT / INCOMING_NOT_ARRIVED 等），
+            事务回滚，责任不变，无部分切换。
+          content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } }
+  /handovers/{id}/confirm-incoming:
+    post:
+      tags: [Handovers]
+      summary: 接班人确认（重复确认幂等；并发完成仅一次切换）
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody: { $ref: '#/components/requestBodies/Confirm' }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/ConfirmResponse' } } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /handovers/{id}/reject:
+    post:
+      tags: [Handovers]
+      summary: 交班人或接班人拒绝（必须填写原因）
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [worker_id, reason]
+              properties:
+                worker_id: { type: integer }
+                reason: { type: string, minLength: 1 }
+      responses:
+        '200': { description: REJECTED, content: { application/json: { schema: { $ref: '#/components/schemas/HandoverResponse' } } } }
+        '400':
+          description: REJECT_REASON_REQUIRED
+          content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /handovers/sweep-timeouts:
+    post:
+      tags: [Admin]
+      summary: 扫描并结算所有已过截止时间的 PENDING 交接
+      responses:
+        '200': { description: OK }
+
+  /clock:
+    get: { tags: [Admin], summary: 读取模拟时钟, responses: { '200': { description: OK } } }
+  /clock/set:
+    post:
+      tags: [Admin]
+      summary: 设置模拟时钟
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [now]
+              properties:
+                now: { type: string, format: date-time, description: 'ISO 8601 或 epoch 毫秒' }
+      responses:
+        '200': { description: OK }
+        '400': { $ref: '#/components/responses/Error' }
+  /clock/advance:
+    post:
+      tags: [Admin]
+      summary: 推进模拟时钟（delta_ms 可为负数）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [delta_ms]
+              properties:
+                delta_ms: { type: integer }
+      responses:
+        '200': { description: OK }
+        '400': { $ref: '#/components/responses/Error' }
+  /audit:
+    get: { tags: [Admin], summary: 全量审计流, responses: { '200': { description: OK } } }
+  /receipts:
+    get: { tags: [Admin], summary: 全量模拟回执, responses: { '200': { description: OK } } }
+
+components:
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer }
+    WorkerId:
+      name: workerId
+      in: path
+      required: true
+      schema: { type: integer }
+  requestBodies:
+    Confirm:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [worker_id]
+            properties:
+              worker_id: { type: integer }
+  schemas:
+    Position:
+      type: string
+      enum: [LEADER, SAFETY_OFFICER, LIAISON, GUARD]
+      description: 负责人 / 安全员 / 联络员 / 防护员
+    TicketState:
+      type: string
+      enum: [CREATED, IN_PROGRESS, CLOSED]
+    HandoverState:
+      type: string
+      enum: [PENDING, COMPLETED, REJECTED, TIMED_OUT, VOIDED]
+    Timestamp:
+      type: object
+      properties:
+        epoch_ms: { type: integer }
+        iso: { type: string, format: date-time }
+    CreatePerson:
+      type: object
+      required: [name, employee_no]
+      properties:
+        name: { type: string }
+        employee_no: { type: string }
+    PersonResponse:
+      type: object
+      properties:
+        person:
+          type: object
+          properties:
+            id: { type: integer }
+            name: { type: string }
+            employee_no: { type: string }
+    QualificationInput:
+      type: object
+      required: [position, valid_from, valid_to]
+      properties:
+        position: { $ref: '#/components/schemas/Position' }
+        valid_from: { oneOf: [{ type: integer }, { type: string, format: date-time }] }
+        valid_to: { oneOf: [{ type: integer }, { type: string, format: date-time }], description: 必须不早于工作票 planned_end 才能覆盖剩余窗口 }
+    CreateTicket:
+      type: object
+      required: [code, title, planned_start, planned_end, positions]
+      properties:
+        code: { type: string }
+        title: { type: string }
+        planned_start: { oneOf: [{ type: integer }, { type: string, format: date-time }] }
+        planned_end: { oneOf: [{ type: integer }, { type: string, format: date-time }] }
+        positions:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/Position' }
+    InitiateHandover:
+      type: object
+      required: [ticket_id, position, incoming_worker_id, initiated_by]
+      properties:
+        ticket_id: { type: integer }
+        position: { $ref: '#/components/schemas/Position' }
+        incoming_worker_id: { type: integer }
+        initiated_by: { type: integer, description: 当前在岗关键岗位人员（负责人/安全员/联络员/防护员之一） }
+        outgoing_worker_id: { type: integer, description: 可选；若提供且非当前在任人则 409 }
+        timeout_ms: { type: integer, description: 可选，默认 30 分钟（模拟时钟） }
+    Handover:
+      type: object
+      properties:
+        id: { type: integer }
+        ticket_id: { type: integer }
+        position:
+          type: object
+          properties:
+            code: { $ref: '#/components/schemas/Position' }
+            label: { type: string }
+        outgoing_worker_id: { type: integer }
+        incoming_worker_id: { type: integer }
+        initiated_by: { type: integer }
+        status: { $ref: '#/components/schemas/HandoverState' }
+        initiated_at: { $ref: '#/components/schemas/Timestamp' }
+        confirm_deadline: { $ref: '#/components/schemas/Timestamp' }
+        outgoing_confirmed_at: { allOf: [{ $ref: '#/components/schemas/Timestamp' }], nullable: true }
+        incoming_confirmed_at: { allOf: [{ $ref: '#/components/schemas/Timestamp' }], nullable: true }
+        completed_at: { allOf: [{ $ref: '#/components/schemas/Timestamp' }], nullable: true }
+        timed_out_at: { allOf: [{ $ref: '#/components/schemas/Timestamp' }], nullable: true }
+        voided_at: { allOf: [{ $ref: '#/components/schemas/Timestamp' }], nullable: true }
+        rejected:
+          nullable: true
+          type: object
+          properties:
+            by: { type: integer }
+            at: { $ref: '#/components/schemas/Timestamp' }
+            reason: { type: string }
+        prev_handover_id: { type: integer, nullable: true }
+        responsibility_snapshot:
+          type: array
+          description: 发起时全岗位责任快照
+          items:
+            type: object
+            properties:
+              position: { type: object }
+              worker_id: { type: integer }
+              assignment_id: { type: integer }
+              since: { $ref: '#/components/schemas/Timestamp' }
+        receipts:
+          type: object
+          properties:
+            init: { type: string }
+            completion: { type: string, nullable: true }
+        audit:
+          type: object
+          properties:
+            created_seq: { type: integer }
+            completed_seq: { type: integer, nullable: true }
+        requires:
+          type: object
+          properties:
+            both_confirmations: { type: boolean }
+            terminal: { type: boolean }
+    HandoverResponse:
+      type: object
+      properties:
+        handover: { $ref: '#/components/schemas/Handover' }
+        receipt: { $ref: '#/components/schemas/Receipt' }
+    ConfirmResponse:
+      type: object
+      properties:
+        handover: { $ref: '#/components/schemas/Handover' }
+        redundant: { type: boolean, description: true 表示重复/并发落败确认，未产生第二次交接 }
+        switched: { type: boolean, description: true 表示本次调用完成原子责任切换 }
+        completion_receipt: { $ref: '#/components/schemas/Receipt' }
+    Receipt:
+      type: object
+      properties:
+        id: { type: integer }
+        ref: { type: string }
+        type:
+          type: string
+          enum:
+            - HANDOVER_INITIATED
+            - HANDOVER_COMPLETED
+            - HANDOVER_REJECTED
+            - HANDOVER_TIMED_OUT
+            - HANDOVER_VOIDED
+            - TICKET_CLOSED
+        ticket_id: { type: integer, nullable: true }
+        handover_id: { type: integer, nullable: true }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        payload: { type: object }
+    TicketResponse:
+      type: object
+      properties:
+        ticket:
+          type: object
+          properties:
+            id: { type: integer }
+            code: { type: string }
+            title: { type: string }
+            status: { $ref: '#/components/schemas/TicketState' }
+            planned_start: { $ref: '#/components/schemas/Timestamp' }
+            planned_end: { $ref: '#/components/schemas/Timestamp' }
+            required_positions:
+              type: array
+              items:
+                type: object
+                properties:
+                  code: { $ref: '#/components/schemas/Position' }
+                  label: { type: string }
+            closure: { $ref: '#/components/schemas/Closure' }
+    Closure:
+      type: object
+      properties:
+        closed_at: { $ref: '#/components/schemas/Timestamp' }
+        final_responsibility:
+          type: array
+          items: { type: object }
+        receipt_ref: { type: string }
+    ClosureResponse:
+      type: object
+      properties:
+        closure: { $ref: '#/components/schemas/Closure' }
+    ErrorBody:
+      type: object
+      properties:
+        error:
+          type: object
+          required: [errorCode, message]
+          properties:
+            errorCode:
+              type: string
+              enum:
+                - NOT_FOUND
+                - INVALID_PAYLOAD
+                - INVALID_JSON
+                - TICKET_NOT_IN_PROGRESS
+                - BEFORE_PLANNED_START
+                - TICKET_CLOSED
+                - POSITION_NOT_REQUIRED
+                - POSITION_NOT_ASSIGNED
+                - OUTGOING_NOT_CURRENT
+                - INCOMING_SAME_AS_OUTGOING
+                - INCOMING_HOLDS_OTHER_POSITION
+                - INCOMING_NOT_ARRIVED
+                - QUALIFICATION_INSUFFICIENT
+                - PENDING_HANDOVER_EXISTS
+                - HANDOVER_NOT_PENDING
+                - HANDOVER_TIMED_OUT
+                - PARTY_MISMATCH
+                - REJECT_REASON_REQUIRED
+                - PENDING_HANDOVERS_BLOCK_CLOSE
+            message: { type: string }
+            details: { type: object, nullable: true }
+  responses:
+    Error:
+      description: 领域错误
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
